@@ -1,6 +1,7 @@
-;; EcoReward - Sustainability Incentive Platform
-;; Version: 1.0.0
+;; EcoReward - Sustainability Incentive Platform with NFT Certificates
+;; Version: 2.0.0
 ;; A platform that rewards users for eco-friendly actions and tracks environmental impact
+;; Now includes NFT certificates for significant environmental milestones
 
 ;; Error constants
 (define-constant err-owner-only (err u100))
@@ -12,6 +13,8 @@
 (define-constant err-unauthorized (err u106))
 (define-constant err-action-already-claimed (err u107))
 (define-constant err-invalid-verifier (err u108))
+(define-constant err-milestone-not-reached (err u109))
+(define-constant err-certificate-already-issued (err u110))
 
 ;; Contract owner
 (define-constant contract-owner tx-sender)
@@ -21,10 +24,15 @@
 (define-constant token-symbol "ECO")
 (define-constant token-decimals u6)
 
+;; NFT constants
+(define-constant nft-name "EcoReward Certificate")
+(define-constant nft-symbol "ECOCERT")
+
 ;; Data variables
 (define-data-var token-uri (optional (string-utf8 256)) none)
 (define-data-var total-supply uint u0)
 (define-data-var next-action-id uint u1)
+(define-data-var next-certificate-id uint u1)
 
 ;; Data maps
 (define-map token-balances principal uint)
@@ -61,6 +69,28 @@
 )
 
 (define-map verified-verifiers principal bool)
+
+;; NFT Certificate maps
+(define-map certificates
+  uint
+  {
+    owner: principal,
+    milestone-type: (string-ascii 50),
+    threshold-value: uint,
+    issued-at: uint,
+    metadata-uri: (optional (string-utf8 256))
+  }
+)
+
+(define-map milestone-thresholds
+  (string-ascii 50)
+  uint
+)
+
+(define-map user-certificates
+  { user: principal, milestone-type: (string-ascii 50) }
+  bool
+)
 
 ;; Private functions
 (define-private (get-balance (user principal))
@@ -107,9 +137,44 @@
   )
 )
 
+(define-private (check-milestone-eligibility (user principal) (milestone-type (string-ascii 50)))
+  (let ((user-data (unwrap! (map-get? user-stats user) (err false)))
+        (threshold (unwrap! (map-get? milestone-thresholds milestone-type) (err false))))
+    (if (is-eq milestone-type "eco-warrior")
+      (ok (>= (get total-actions user-data) threshold))
+      (if (is-eq milestone-type "impact-champion")
+        (ok (>= (get total-impact user-data) threshold))
+        (if (is-eq milestone-type "green-pioneer")
+          (ok (>= (get total-rewards user-data) threshold))
+          (ok false)
+        )
+      )
+    )
+  )
+)
+
+(define-private (mint-certificate (recipient principal) (milestone-type (string-ascii 50)) (threshold-value uint))
+  (let ((certificate-id (var-get next-certificate-id))
+        (current-block stacks-block-height))
+    (begin
+      (map-set certificates certificate-id {
+        owner: recipient,
+        milestone-type: milestone-type,
+        threshold-value: threshold-value,
+        issued-at: current-block,
+        metadata-uri: none
+      })
+      
+      (map-set user-certificates { user: recipient, milestone-type: milestone-type } true)
+      (var-set next-certificate-id (+ certificate-id u1))
+      (ok certificate-id)
+    )
+  )
+)
+
 ;; Public functions
 
-;; Initialize default action types
+;; Initialize default action types and milestones
 (define-public (initialize-action-types)
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -118,6 +183,12 @@
     (map-set action-types "solar-energy" { base-reward: u300, impact-multiplier: u5, enabled: true })
     (map-set action-types "bike-commute" { base-reward: u50, impact-multiplier: u1, enabled: true })
     (map-set action-types "composting" { base-reward: u75, impact-multiplier: u2, enabled: true })
+    
+    ;; Initialize milestone thresholds
+    (map-set milestone-thresholds "eco-warrior" u50)      ;; 50 actions
+    (map-set milestone-thresholds "impact-champion" u1000) ;; 1000 impact points
+    (map-set milestone-thresholds "green-pioneer" u10000)  ;; 10,000 tokens earned
+    
     (ok true)
   )
 )
@@ -134,6 +205,17 @@
       impact-multiplier: impact-multiplier,
       enabled: true
     })
+    (ok true)
+  )
+)
+
+;; Add milestone threshold
+(define-public (add-milestone (milestone-type (string-ascii 50)) (threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> threshold u0) err-invalid-amount)
+    (asserts! (> (len milestone-type) u0) err-invalid-action)
+    (map-set milestone-thresholds milestone-type threshold)
     (ok true)
   )
 )
@@ -212,6 +294,22 @@
   )
 )
 
+;; Claim milestone certificate
+(define-public (claim-certificate (milestone-type (string-ascii 50)))
+  (let ((threshold (unwrap! (map-get? milestone-thresholds milestone-type) err-not-found)))
+    (begin
+      (asserts! (> (len milestone-type) u0) err-invalid-action)
+      (asserts! (not (default-to false (map-get? user-certificates { user: tx-sender, milestone-type: milestone-type }))) 
+                err-certificate-already-issued)
+      
+      (let ((is-eligible (unwrap! (check-milestone-eligibility tx-sender milestone-type) err-milestone-not-reached)))
+        (asserts! is-eligible err-milestone-not-reached)
+        (mint-certificate tx-sender milestone-type threshold)
+      )
+    )
+  )
+)
+
 ;; Transfer tokens
 (define-public (transfer (amount uint) (recipient principal))
   (let ((sender-balance (get-balance tx-sender))
@@ -239,6 +337,15 @@
     symbol: token-symbol,
     decimals: token-decimals,
     total-supply: (var-get total-supply)
+  }
+)
+
+;; Get NFT info
+(define-read-only (get-nft-info)
+  {
+    name: nft-name,
+    symbol: nft-symbol,
+    total-certificates: (- (var-get next-certificate-id) u1)
   }
 )
 
@@ -270,4 +377,27 @@
 ;; Check if verifier is authorized
 (define-read-only (is-verifier (verifier principal))
   (default-to false (map-get? verified-verifiers verifier))
+)
+
+;; Get certificate details
+(define-read-only (get-certificate (certificate-id uint))
+  (map-get? certificates certificate-id)
+)
+
+;; Get milestone threshold
+(define-read-only (get-milestone-threshold (milestone-type (string-ascii 50)))
+  (map-get? milestone-thresholds milestone-type)
+)
+
+;; Check if user has certificate
+(define-read-only (has-certificate (user principal) (milestone-type (string-ascii 50)))
+  (default-to false (map-get? user-certificates { user: user, milestone-type: milestone-type }))
+)
+
+;; Check milestone eligibility
+(define-read-only (check-milestone-status (user principal) (milestone-type (string-ascii 50)))
+  (match (check-milestone-eligibility user milestone-type)
+    eligible-result (ok eligible-result)
+    error-val (ok false)
+  )
 )
