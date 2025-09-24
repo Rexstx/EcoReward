@@ -1,7 +1,7 @@
-;; EcoReward - Sustainability Incentive Platform with NFT Certificates
-;; Version: 2.0.0
-;; A platform that rewards users for eco-friendly actions and tracks environmental impact
-;; Now includes NFT certificates for significant environmental milestones
+;; EcoReward - Sustainability Incentive Platform with NFT Certificates and Marketplace
+;; Version: 3.0.0
+;; A platform that rewards users for eco-friendly actions, tracks environmental impact,
+;; and includes a marketplace for eco-friendly products and services
 
 ;; Error constants
 (define-constant err-owner-only (err u100))
@@ -15,6 +15,10 @@
 (define-constant err-invalid-verifier (err u108))
 (define-constant err-milestone-not-reached (err u109))
 (define-constant err-certificate-already-issued (err u110))
+(define-constant err-invalid-listing (err u111))
+(define-constant err-listing-not-active (err u112))
+(define-constant err-cannot-buy-own-listing (err u113))
+(define-constant err-invalid-merchant (err u114))
 
 ;; Contract owner
 (define-constant contract-owner tx-sender)
@@ -33,6 +37,7 @@
 (define-data-var total-supply uint u0)
 (define-data-var next-action-id uint u1)
 (define-data-var next-certificate-id uint u1)
+(define-data-var next-listing-id uint u1)
 
 ;; Data maps
 (define-map token-balances principal uint)
@@ -64,6 +69,7 @@
     total-actions: uint,
     total-impact: uint,
     total-rewards: uint,
+    total-spent: uint,
     last-action-block: uint
   }
 )
@@ -91,6 +97,36 @@
   { user: principal, milestone-type: (string-ascii 50) }
   bool
 )
+
+;; Marketplace maps
+(define-map marketplace-listings
+  uint
+  {
+    merchant: principal,
+    title: (string-utf8 100),
+    description: (string-utf8 500),
+    category: (string-ascii 30),
+    price: uint,
+    active: bool,
+    created-at: uint,
+    updated-at: uint
+  }
+)
+
+(define-map verified-merchants principal bool)
+
+(define-map marketplace-purchases
+  uint
+  {
+    listing-id: uint,
+    buyer: principal,
+    merchant: principal,
+    price: uint,
+    purchased-at: uint
+  }
+)
+
+(define-data-var next-purchase-id uint u1)
 
 ;; Private functions
 (define-private (get-balance (user principal))
@@ -172,6 +208,16 @@
   )
 )
 
+(define-private (is-valid-category (category (string-ascii 30)))
+  (or (is-eq category "solar")
+      (or (is-eq category "transportation")
+          (or (is-eq category "food")
+              (or (is-eq category "clothing")
+                  (or (is-eq category "home")
+                      (or (is-eq category "garden")
+                          (is-eq category "services")))))))
+)
+
 ;; Public functions
 
 ;; Initialize default action types and milestones
@@ -230,6 +276,16 @@
   )
 )
 
+;; Add verified merchant
+(define-public (add-merchant (merchant principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-standard merchant) err-unauthorized)
+    (map-set verified-merchants merchant true)
+    (ok true)
+  )
+)
+
 ;; Submit eco action
 (define-public (submit-eco-action (action-type (string-ascii 50)) (impact-score uint))
   (let ((action-id (var-get next-action-id))
@@ -268,7 +324,7 @@
             (reward-amount (get reward-amount action-data))
             (impact-score (get impact-score action-data))
             (current-stats (default-to 
-              { total-actions: u0, total-impact: u0, total-rewards: u0, last-action-block: u0 }
+              { total-actions: u0, total-impact: u0, total-rewards: u0, total-spent: u0, last-action-block: u0 }
               (map-get? user-stats user))))
         
         ;; Update action as verified
@@ -285,6 +341,7 @@
           total-actions: (+ (get total-actions current-stats) u1),
           total-impact: (+ (get total-impact current-stats) impact-score),
           total-rewards: (+ (get total-rewards current-stats) reward-amount),
+          total-spent: (get total-spent current-stats),
           last-action-block: stacks-block-height
         })
         
@@ -305,6 +362,128 @@
       (let ((is-eligible (unwrap! (check-milestone-eligibility tx-sender milestone-type) err-milestone-not-reached)))
         (asserts! is-eligible err-milestone-not-reached)
         (mint-certificate tx-sender milestone-type threshold)
+      )
+    )
+  )
+)
+
+;; Create marketplace listing
+(define-public (create-listing 
+  (title (string-utf8 100)) 
+  (description (string-utf8 500)) 
+  (category (string-ascii 30)) 
+  (price uint))
+  (let ((listing-id (var-get next-listing-id))
+        (current-block stacks-block-height))
+    (begin
+      (asserts! (default-to false (map-get? verified-merchants tx-sender)) err-invalid-merchant)
+      (asserts! (> (len title) u0) err-invalid-listing)
+      (asserts! (> (len description) u0) err-invalid-listing)
+      (asserts! (is-valid-category category) err-invalid-listing)
+      (asserts! (> price u0) err-invalid-amount)
+      
+      (map-set marketplace-listings listing-id {
+        merchant: tx-sender,
+        title: title,
+        description: description,
+        category: category,
+        price: price,
+        active: true,
+        created-at: current-block,
+        updated-at: current-block
+      })
+      
+      (var-set next-listing-id (+ listing-id u1))
+      (ok listing-id)
+    )
+  )
+)
+
+;; Update marketplace listing
+(define-public (update-listing 
+  (listing-id uint) 
+  (title (string-utf8 100)) 
+  (description (string-utf8 500)) 
+  (category (string-ascii 30)) 
+  (price uint))
+  (let ((listing-data (unwrap! (map-get? marketplace-listings listing-id) err-not-found))
+        (current-block stacks-block-height))
+    (begin
+      (asserts! (is-eq tx-sender (get merchant listing-data)) err-unauthorized)
+      (asserts! (> (len title) u0) err-invalid-listing)
+      (asserts! (> (len description) u0) err-invalid-listing)
+      (asserts! (is-valid-category category) err-invalid-listing)
+      (asserts! (> price u0) err-invalid-amount)
+      
+      (map-set marketplace-listings listing-id (merge listing-data {
+        title: title,
+        description: description,
+        category: category,
+        price: price,
+        updated-at: current-block
+      }))
+      
+      (ok true)
+    )
+  )
+)
+
+;; Deactivate marketplace listing
+(define-public (deactivate-listing (listing-id uint))
+  (let ((listing-data (unwrap! (map-get? marketplace-listings listing-id) err-not-found)))
+    (begin
+      (asserts! (is-eq tx-sender (get merchant listing-data)) err-unauthorized)
+      (asserts! (get active listing-data) err-listing-not-active)
+      
+      (map-set marketplace-listings listing-id (merge listing-data {
+        active: false,
+        updated-at: stacks-block-height
+      }))
+      
+      (ok true)
+    )
+  )
+)
+
+;; Purchase from marketplace
+(define-public (purchase-item (listing-id uint))
+  (let ((listing-data (unwrap! (map-get? marketplace-listings listing-id) err-not-found))
+        (purchase-id (var-get next-purchase-id))
+        (current-block stacks-block-height))
+    (begin
+      (asserts! (get active listing-data) err-listing-not-active)
+      (asserts! (not (is-eq tx-sender (get merchant listing-data))) err-cannot-buy-own-listing)
+      
+      (let ((price (get price listing-data))
+            (merchant (get merchant listing-data))
+            (buyer-balance (get-balance tx-sender))
+            (merchant-balance (get-balance merchant))
+            (current-stats (default-to 
+              { total-actions: u0, total-impact: u0, total-rewards: u0, total-spent: u0, last-action-block: u0 }
+              (map-get? user-stats tx-sender))))
+        
+        (asserts! (>= buyer-balance price) err-insufficient-balance)
+        
+        ;; Transfer tokens from buyer to merchant
+        (try! (set-balance tx-sender (- buyer-balance price)))
+        (try! (set-balance merchant (+ merchant-balance price)))
+        
+        ;; Record purchase
+        (map-set marketplace-purchases purchase-id {
+          listing-id: listing-id,
+          buyer: tx-sender,
+          merchant: merchant,
+          price: price,
+          purchased-at: current-block
+        })
+        
+        ;; Update buyer stats
+        (map-set user-stats tx-sender (merge current-stats {
+          total-spent: (+ (get total-spent current-stats) price)
+        }))
+        
+        (var-set next-purchase-id (+ purchase-id u1))
+        (ok purchase-id)
       )
     )
   )
@@ -349,6 +528,14 @@
   }
 )
 
+;; Get marketplace info
+(define-read-only (get-marketplace-info)
+  {
+    total-listings: (- (var-get next-listing-id) u1),
+    total-purchases: (- (var-get next-purchase-id) u1)
+  }
+)
+
 ;; Get balance
 (define-read-only (get-balance-of (user principal))
   (ok (get-balance user))
@@ -379,6 +566,11 @@
   (default-to false (map-get? verified-verifiers verifier))
 )
 
+;; Check if merchant is authorized
+(define-read-only (is-merchant (merchant principal))
+  (default-to false (map-get? verified-merchants merchant))
+)
+
 ;; Get certificate details
 (define-read-only (get-certificate (certificate-id uint))
   (map-get? certificates certificate-id)
@@ -400,4 +592,14 @@
     eligible-result (ok eligible-result)
     error-val (ok false)
   )
+)
+
+;; Get marketplace listing
+(define-read-only (get-listing (listing-id uint))
+  (map-get? marketplace-listings listing-id)
+)
+
+;; Get purchase details
+(define-read-only (get-purchase (purchase-id uint))
+  (map-get? marketplace-purchases purchase-id)
 )
